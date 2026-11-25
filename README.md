@@ -43,7 +43,7 @@ python play_mirror.py --horizontal --execute
 
 `--horizontal` 把推砖限制为横向，仍允许纵向直接配对。可加 `--limit 3` 先验证前三步。
 
-要连续打关，先在 Mac 微信的「获取奖励」画面截图并校准。连玩会点「确定」，等新棋盘识别成功后继续。
+要连续打关，先在 Mac 微信的「获取奖励」画面截图并校准。连玩会点「确定」，等新棋盘识别成功后继续。如果游戏直接进入下一关，脚本也会识别新棋盘。新图案会按当前棋盘归组。连玩时使用 `--horizontal` 会优先尝试横向推砖，超时或无解时再尝试允许纵向推砖的求解器。
 
 ```sh
 ./bin/mirror --wechat frame .local/reward.png

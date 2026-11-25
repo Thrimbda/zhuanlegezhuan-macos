@@ -152,6 +152,13 @@ def match_picker(expected, move):
     return target, tile, alternatives
 
 
+def bright_tile(image, cell):
+    x, y = point(cell, wechat=True)
+    corners = (image.getpixel((x + dx, y + dy))
+               for dx, dy in ((-14, -14), (14, -14), (-14, 13), (14, 13)))
+    return sum(r > 220 and g > 230 and b > 180 for r, g, b in corners) >= 3
+
+
 def match_picker_visible(board, picker, frame_data):
     if board is None or picker is None or board.count(None) <= len(board) // 2:
         return False
@@ -163,14 +170,8 @@ def match_picker_visible(board, picker, frame_data):
     with Image.open(BytesIO(frame_data)) as image:
         image = image.convert("RGB")
 
-    def highlighted(cell):
-        x, y = point(cell, wechat=True)
-        corners = (image.getpixel((x + dx, y + dy))
-                   for dx, dy in ((-14, -14), (14, -14), (-14, 13), (14, 13)))
-        return sum(r > 220 and g > 230 and b > 180 for r, g, b in corners) >= 3
-
-    return highlighted(target) and any(
-        label == tile and cell != target and highlighted(cell)
+    return bright_tile(image, target) and any(
+        label == tile and cell != target and bright_tile(image, cell)
         for cell, label in enumerate(board)
     )
 
@@ -198,14 +199,33 @@ def submit(mirror, move, wechat=False):
         raise RuntimeError("Mirror helper did not acknowledge input")
 
 
-def solve(board, solver):
+class SolverError(RuntimeError):
+    pass
+
+
+def solve(board, solver, timeout=60):
     request = dict(cmd="solve", board=board, rows=ROWS, cols=COLS, max_ms=20000)
-    process = subprocess.run([BIN / solver], input=json.dumps(request) + "\n",
-                             capture_output=True, text=True, check=True, timeout=60)
+    try:
+        process = subprocess.run([BIN / solver], input=json.dumps(request) + "\n",
+                                 capture_output=True, text=True, check=True, timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        raise SolverError(f"{solver} timed out after {timeout}s") from error
     plan = json.loads(process.stdout)
     if not plan["solved"]:
-        raise RuntimeError(f"Solver stopped: {plan['reason']}")
+        raise SolverError(f"{solver} stopped: {plan['reason']}")
     return plan["moves"]
+
+
+def plan_moves(board, args):
+    if not args.horizontal:
+        return solve(board, "solve")
+    if not args.loop:
+        return solve(board, "solve-horizontal")
+    try:
+        return solve(board, "solve-horizontal", timeout=10)
+    except SolverError as error:
+        print(f"{error}; retrying with vertical pushes enabled", flush=True)
+        return solve(board, "solve")
 
 
 def load_samples(prefix=""):
@@ -248,12 +268,10 @@ def dialog_action(image, dialogs):
     return None
 
 
-def learn_new_tiles(board, cells, samples):
+def learn_new_tiles(board, cells, samples, image):
     unknown = {i for i, label in enumerate(board) if label is None}
     known = Counter(label for label in board if label is not None)
-    # Learn only from a fresh, full board with enough recognized tiles to distinguish
-    # the board from a dimmed overlay. Existing tile types must still make complete pairs.
-    if not unknown or EMPTY in known or sum(known.values()) <= len(board) // 2:
+    if not unknown or any(not bright_tile(image, i) for i in unknown):
         return None
     if any(count % 2 for count in known.values()):
         return None
@@ -283,6 +301,18 @@ def learn_new_tiles(board, cells, samples):
     return result, additions
 
 
+def recognize_wechat_board(image, samples):
+    image = image.convert("RGB")
+    cells = patches(image, wechat=True)
+    board = recognize(cells, samples)
+    if None in board:
+        return learn_new_tiles(board, cells, samples, image)
+    tiles = Counter(label for label in board if label != EMPTY)
+    if tiles and all(count % 2 == 0 for count in tiles.values()):
+        return board, []
+    return None
+
+
 def next_wechat_board(mirror, samples, dialogs, debug_path, *, after_clear=False):
     pressed = set()
     deadline = time.monotonic() + 20
@@ -293,18 +323,14 @@ def next_wechat_board(mirror, samples, dialogs, debug_path, *, after_clear=False
             last_frame = data
             with Image.open(BytesIO(data)) as image:
                 dialog = dialog_action(image, dialogs)
-                if dialog is None and (not after_clear or pressed):
-                    cells = patches(image, wechat=True)
-                    board = recognize(cells, samples)
-                    tiles = Counter(label for label in board if label != EMPTY)
-                    if None not in board and tiles and all(count % 2 == 0 for count in tiles.values()):
-                        return board
-                    learned = learn_new_tiles(board, cells, samples)
-                    if learned is not None:
-                        board, additions = learned
-                        samples.extend(additions)
-                        print(f"Learned {len({label for label, _ in additions})} new tile types", flush=True)
-                        return board
+                if dialog is None:
+                    recognized = recognize_wechat_board(image, samples)
+                    if recognized is not None:
+                        board, additions = recognized
+                        if not after_clear or pressed or EMPTY not in board:
+                            if additions:
+                                print(f"Learned {len({label for label, _ in additions})} new tile types", flush=True)
+                            return board, samples + additions
             if dialog is not None:
                 action, target = dialog
                 if action not in pressed:
@@ -336,7 +362,7 @@ def wait_for_reward(mirror, dialogs, debug_path):
 
 
 def play_board(mirror, board, samples, args):
-    moves = solve(board, "solve-horizontal" if args.horizontal else "solve")
+    moves = plan_moves(board, args)
     print(f"Board recognized, {len(moves)} pairs to clear", flush=True)
     if not args.execute:
         return
@@ -349,6 +375,10 @@ def play_board(mirror, board, samples, args):
                 move = direct
         submit(mirror, move, args.wechat)
         actual, last_frame = verify_move(mirror, samples, expected, move, args.wechat)
+        if actual == board:
+            print(f"Move {number} left the board unchanged; retrying once", flush=True)
+            submit(mirror, move, args.wechat)
+            actual, last_frame = verify_move(mirror, samples, expected, move, args.wechat)
         if actual != expected:
             if last_frame is not None:
                 args.debug.write_bytes(last_frame)
@@ -385,18 +415,21 @@ def main():
     with mirror_session(args.wechat) as mirror:
         if args.loop:
             dialogs = load_dialogs()
-            board = next_wechat_board(mirror, samples, dialogs, args.debug)
+            board, board_samples = next_wechat_board(mirror, samples, dialogs, args.debug)
             for number in count(args.start_level or 1):
                 name = "level" if args.start_level is not None else "board"
                 print(f"Playing {name} {number}", flush=True)
-                play_board(mirror, board, samples, args)
+                play_board(mirror, board, board_samples, args)
                 if number == args.stop_level:
                     wait_for_reward(mirror, dialogs, args.debug)
                     print(f"Cleared level {number}; reward screen verified", flush=True)
                     return
-                board = next_wechat_board(mirror, samples, dialogs, args.debug, after_clear=True)
+                board, board_samples = next_wechat_board(mirror, samples, dialogs, args.debug, after_clear=True)
+        elif args.wechat:
+            board, board_samples = next_wechat_board(mirror, samples, {}, args.debug)
+            play_board(mirror, board, board_samples, args)
         else:
-            board, _ = confirm_board(mirror, samples, wechat=args.wechat)
+            board, _ = confirm_board(mirror, samples)
             if board is None:
                 raise RuntimeError("Mirror window produced no video frames")
             if None in board:
